@@ -11,7 +11,11 @@ from typing import Dict, Tuple
 import logging
 import scipy.spatial as spatial
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logger = logging.getLogger(__name__)
 
 
@@ -42,13 +46,11 @@ class FCBlock(nn.Module):
     """Fully connected block for SIREN architecture."""
 
     def __init__(self, in_features, out_features, num_hidden_layers, hidden_features,
-                 outermost_linear=False, nonlinearity='sine', init_type='siren'):
+                 outermost_linear=False, init_type='siren'):
         super().__init__()
 
         self.init_type = init_type
-
-        nl_dict = {'sine': Sine(), 'relu': nn.ReLU(inplace=True)}
-        nl = nl_dict[nonlinearity]
+        nl = Sine()
 
         self.net = []
         self.net.append(nn.Sequential(nn.Linear(in_features, hidden_features), nl))
@@ -100,19 +102,16 @@ class Decoder(nn.Module):
 class NeurCADReconNetwork(nn.Module):
     """NeurCADRecon network implementation."""
 
-    def __init__(self, in_dim=3, decoder_hidden_dim=256, decoder_n_hidden_layers=4,
-                 init_type='siren', sphere_init_params=[1.6, 0.1], udf=False):
+    def __init__(self, in_dim=3, decoder_hidden_dim=256, decoder_n_hidden_layers=4, udf=False):
         super().__init__()
 
-        self.init_type = init_type
         self.decoder = Decoder(udf=udf)
         self.decoder.fc_block = FCBlock(
             in_dim, 1,
             num_hidden_layers=decoder_n_hidden_layers,
             hidden_features=decoder_hidden_dim,
             outermost_linear=True,
-            nonlinearity='sine',
-            init_type=init_type
+            init_type='siren'
         )
 
     def forward(self, points):
@@ -130,7 +129,6 @@ class MeshPreprocessor:
         self.normals = None
         self.center = None
         self.scale = None
-        self.bbox = None
 
     def load_and_preprocess(self) -> Tuple[np.ndarray, np.ndarray]:
         """Load mesh and preprocess it."""
@@ -148,8 +146,6 @@ class MeshPreprocessor:
         self.scale = np.abs(points).max()
         points = points / (self.scale * 2.0)
 
-        self.bbox = np.array([[-0.5, 0.5], [-0.5, 0.5], [-0.5, 0.5]])
-
         self.points = points.astype(np.float32)
         self.normals = normals.astype(np.float32)
 
@@ -159,7 +155,7 @@ class MeshPreprocessor:
         return self.points, self.normals
 
     def estimate_normals_with_open3d(self, points: np.ndarray, k_neighbors: int = 30) -> np.ndarray:
-        """Estimate normals from point cloud using Open3D's built-in method."""
+        """Estimate normals from point cloud using Open3D's built-in method with consistent orientation."""
         logger.info(f"Estimating normals from {points.shape[0]} points using Open3D")
 
         pcd = o3d.geometry.PointCloud()
@@ -169,13 +165,41 @@ class MeshPreprocessor:
             search_param=o3d.geometry.KDTreeSearchParamKNN(knn=k_neighbors)
         )
 
+        pcd.orient_normals_consistent_tangent_plane(k=k_neighbors)
+        
         estimated_normals = np.asarray(pcd.normals)
+        
+        logger.info("Open3D normal estimation and consistent orientation completed")
 
-        logger.info("Open3D normal estimation completed")
+        consistency_score = self.check_normal_consistency(points, estimated_normals, k_neighbors)
+        logger.info(f"Normal consistency score: {consistency_score:.4f}")
+        
         return estimated_normals.astype(np.float32)
+    
+    def check_normal_consistency(self, points: np.ndarray, normals: np.ndarray, k_neighbors: int = 30) -> float:
+        """
+        Check the consistency of normal orientations across the surface.
+        Returns a score between 0 and 1, where 1 means perfect consistency.
+        """
+        kd_tree = spatial.KDTree(points)
+        n_samples = min(1000, len(points))  # Sample points for efficiency
+        sample_indices = np.random.choice(len(points), n_samples, replace=False)
 
-    def sample_training_data(self, n_points: int = 20000, n_samples: int = 10000, use_estimated_normals: bool = True) -> \
-    Dict[str, np.ndarray]:
+        consistent_pairs = 0
+        total_pairs = 0
+
+        for idx in sample_indices:
+            distances, neighbor_indices = kd_tree.query(points[idx], k=k_neighbors+1)
+            neighbor_indices = neighbor_indices[1:]  # Exclude self
+
+            for neighbor_idx in neighbor_indices:
+                if np.dot(normals[idx], normals[neighbor_idx]) > 0:
+                    consistent_pairs += 1
+                total_pairs += 1
+
+        return consistent_pairs / total_pairs if total_pairs > 0 else 0.0
+
+    def sample_training_data(self, n_points: int = 20000, use_estimated_normals: bool = True) -> Dict[str, np.ndarray]:
         """Sample training data including manifold and non-manifold points."""
 
         manifold_indices = np.random.permutation(self.points.shape[0])
@@ -207,18 +231,14 @@ class MeshPreprocessor:
 class NormalBasedSDFLoss(nn.Module):
     """SDF loss that uses normals to determine inside/outside for non-watertight surfaces."""
 
-    def __init__(self, loss_type='normal_based_sdf'):
+    def __init__(self):
         super().__init__()
 
         self.sdf_weight = 7e3
         self.eikonal_weight = 6e2
-        self.normal_weight = 0
         self.orientation_weight = 5e1
         self.morse_weight = 10
         self.gradient_normal_weight = 2e2
-
-        self.loss_type = loss_type
-        self.use_morse = 'morse' in loss_type
 
     def gradient(self, inputs, outputs, create_graph=True, retain_graph=True):
         """Compute gradients."""
@@ -288,7 +308,6 @@ class NormalBasedSDFLoss(nn.Module):
 
         sdf_loss = torch.mean(manifold_pred ** 2)
         eikonal_loss = torch.mean((torch.norm(manifold_grad, dim=-1) - 1) ** 2)
-        normal_loss = torch.mean((manifold_grad - manifold_normals) ** 2)
 
         orientation_signs = self.compute_orientation_sign(
             nonmanifold_points, manifold_points, manifold_normals, k_neighbors=2
@@ -297,7 +316,7 @@ class NormalBasedSDFLoss(nn.Module):
         orientation_loss = torch.mean(torch.relu(-nonmanifold_pred * target_signs + 0.1))
 
         morse_loss = torch.tensor(0.0, device=manifold_points.device)
-        if self.use_morse and near_points_pred is not None:
+        if near_points_pred is not None:
             near_grad = self.gradient(near_points, near_points_pred)
             morse_loss = torch.mean(torch.relu(-near_points_pred + 0.05))
 
@@ -305,7 +324,6 @@ class NormalBasedSDFLoss(nn.Module):
 
         total_loss = (self.sdf_weight * sdf_loss +
                       self.eikonal_weight * eikonal_loss +
-                      self.normal_weight * normal_loss +
                       self.orientation_weight * orientation_loss +
                       self.morse_weight * morse_loss +
                       self.gradient_normal_weight * gradient_normal_loss)
@@ -314,7 +332,6 @@ class NormalBasedSDFLoss(nn.Module):
             'loss': total_loss,
             'sdf_loss': sdf_loss,
             'eikonal_loss': eikonal_loss,
-            'normal_loss': normal_loss,
             'orientation_loss': orientation_loss,
             'morse_loss': morse_loss,
             'gradient_normal_loss': gradient_normal_loss
@@ -330,10 +347,9 @@ class MeshReconstructor:
         self.network = network
         self.device = device
 
-    def get_3d_grid(self, resolution: int = 256, bbox: np.ndarray = None) -> Dict[str, torch.Tensor]:
+    def get_3d_grid(self, resolution: int = 256) -> Dict[str, torch.Tensor]:
         """Generate 3D grid for marching cubes."""
-        if bbox is None:
-            bbox = np.array([[-0.5, 0.5], [-0.5, 0.5], [-0.5, 0.5]])
+        bbox = np.array([[-0.5, 0.5], [-0.5, 0.5], [-0.5, 0.5]])
 
         x = np.linspace(bbox[0, 0], bbox[0, 1], resolution)
         y = np.linspace(bbox[1, 0], bbox[1, 1], resolution)
@@ -380,7 +396,7 @@ class MeshReconstructor:
 
 
 def train_neurcadrecon(mesh_path: str, output_dir: str, num_epochs: int = 100,
-                       batch_size: int = 1, lr: float = 5e-5, device: str = 'cuda'):
+                       lr: float = 5e-5, device: str = 'cuda'):
     """Main training function for normal-based SDF reconstruction."""
 
     os.makedirs(output_dir, exist_ok=True)
@@ -396,7 +412,6 @@ def train_neurcadrecon(mesh_path: str, output_dir: str, num_epochs: int = 100,
         in_dim=3,
         decoder_hidden_dim=256,
         decoder_n_hidden_layers=4,
-        init_type='siren',
         udf=False
     ).to(device)
 
@@ -404,12 +419,11 @@ def train_neurcadrecon(mesh_path: str, output_dir: str, num_epochs: int = 100,
     criterion = NormalBasedSDFLoss()
 
     logger.info("Starting training...")
-    best_loss = float('inf')
 
     for epoch in range(num_epochs):
         network.train()
 
-        training_data = preprocessor.sample_training_data(n_points=20000, n_samples=1, use_estimated_normals=True)
+        training_data = preprocessor.sample_training_data(n_points=20000, use_estimated_normals=True)
 
         for key in training_data:
             training_data[key] = torch.tensor(training_data[key], device=device, dtype=torch.float32)
@@ -435,13 +449,9 @@ def train_neurcadrecon(mesh_path: str, output_dir: str, num_epochs: int = 100,
         if epoch % 10 == 0:
             logger.info(f"Epoch {epoch}/{num_epochs}, Loss: {loss.item():.6f}")
             logger.info(f"  SDF: {loss_dict['sdf_loss']:.6f}, Eikonal: {loss_dict['eikonal_loss']:.6f}")
-            logger.info(f"  Normal: {loss_dict['normal_loss']:.6f}, Orientation: {loss_dict['orientation_loss']:.6f}")
+            logger.info(f"  Orientation: {loss_dict['orientation_loss']:.6f}")
 
-        if loss.item() < best_loss:
-            best_loss = loss.item()
-            torch.save(network.state_dict(), os.path.join(output_dir, 'best_model.pth'))
-
-    logger.info(f"Training completed. Best loss: {best_loss:.6f}")
+    logger.info("Training completed.")
 
     logger.info("Reconstructing mesh using normal-based SDF...")
     reconstructor = MeshReconstructor(network, device)
@@ -455,10 +465,9 @@ def train_neurcadrecon(mesh_path: str, output_dir: str, num_epochs: int = 100,
 
 
 def main():
-    input_mesh_path = "/home/mikolaj/Documents/github/inr_voronoi/data/sphylinder/sphylinder.obj"
+    input_mesh_path = "/home/mikolaj/Documents/github/inr_voronoi/data/sphylinder/cylinder.obj"
     output_directory = "/home/mikolaj/Downloads"
-    num_epochs = 200
-    batch_size = 1
+    num_epochs = 500
     learning_rate = 5e-5
     device = 'cuda'
 
@@ -471,7 +480,6 @@ def main():
             mesh_path=input_mesh_path,
             output_dir=output_directory,
             num_epochs=num_epochs,
-            batch_size=batch_size,
             lr=learning_rate,
             device=device
         )

@@ -122,8 +122,9 @@ class NeurCADReconNetwork(nn.Module):
 class MeshPreprocessor:
     """Handles mesh loading, preprocessing, and sampling."""
 
-    def __init__(self, mesh_path: str):
+    def __init__(self, mesh_path: str, padding: float = 0.05):
         self.mesh_path = mesh_path
+        self.padding = padding
         self.mesh = None
         self.points = None
         self.normals = None
@@ -211,7 +212,9 @@ class MeshPreprocessor:
         else:
             manifold_normals = self.normals[manifold_idx]
 
-        nonmanifold_points = np.random.uniform(-0.5, 0.5, size=(n_points, 3)).astype(np.float32)
+        # Sample non-manifold points from the padded cube to match reconstruction grid
+        padded_bounds = 0.5 + self.padding
+        nonmanifold_points = np.random.uniform(-padded_bounds, padded_bounds, size=(n_points, 3)).astype(np.float32)
 
         kd_tree = spatial.KDTree(self.points)
         dist, _ = kd_tree.query(self.points, k=51, workers=-1)
@@ -347,9 +350,12 @@ class MeshReconstructor:
         self.network = network
         self.device = device
 
-    def get_3d_grid(self, resolution: int = 256) -> Dict[str, torch.Tensor]:
-        """Generate 3D grid for marching cubes."""
-        bbox = np.array([[-0.5, 0.5], [-0.5, 0.5], [-0.5, 0.5]])
+    def get_3d_grid(self, resolution: int = 256, padding: float = 0.05) -> Dict[str, torch.Tensor]:
+        """Generate 3D grid for marching cubes with padding to ensure edge reconstruction."""
+        # Add padding to ensure objects on edges are properly reconstructed
+        bbox = np.array([[-0.5 - padding, 0.5 + padding], 
+                        [-0.5 - padding, 0.5 + padding], 
+                        [-0.5 - padding, 0.5 + padding]])
 
         x = np.linspace(bbox[0, 0], bbox[0, 1], resolution)
         y = np.linspace(bbox[1, 0], bbox[1, 1], resolution)
@@ -361,15 +367,16 @@ class MeshReconstructor:
 
         return {
             "grid_points": grid_points,
-            "xyz": [x, y, z]
+            "xyz": [x, y, z],
+            "bbox": bbox
         }
 
-    def reconstruct_mesh(self, resolution: int = 256, chunk_size: int = 10000) -> trimesh.Trimesh:
+    def reconstruct_mesh(self, resolution: int = 256, chunk_size: int = 10000, padding: float = 0.1) -> trimesh.Trimesh:
         """Reconstruct mesh using marching cubes for SDF."""
-        logger.info("Starting mesh reconstruction for SDF...")
+        logger.info(f"Starting mesh reconstruction for SDF with {padding:.3f} padding...")
 
         self.network.eval()
-        grid_dict = self.get_3d_grid(resolution=resolution)
+        grid_dict = self.get_3d_grid(resolution=resolution, padding=padding)
         grid_points = grid_dict["grid_points"]
 
         z_values = []
@@ -382,12 +389,17 @@ class MeshReconstructor:
         z_values = np.concatenate(z_values, axis=0)
 
         x, y, z = grid_dict["xyz"]
+        bbox = grid_dict["bbox"]
         z_grid = z_values.reshape(len(x), len(y), len(z))
 
         logger.info("Applying marching cubes with threshold 0...")
         vertices, faces = mcubes.marching_cubes(z_grid, 0)
 
-        vertices = vertices * (1.0 / resolution) * 1.0
+        # Scale vertices to match the padded bbox
+        bbox_size = bbox[:, 1] - bbox[:, 0]
+        logger.info(f"Grid bbox: X[{bbox[0, 0]:.3f}, {bbox[0, 1]:.3f}], Y[{bbox[1, 0]:.3f}, {bbox[1, 1]:.3f}], Z[{bbox[2, 0]:.3f}, {bbox[2, 1]:.3f}]")
+        vertices = vertices * (bbox_size / resolution)
+        vertices = vertices + bbox[:, 0]
 
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
 
@@ -405,8 +417,9 @@ def train_neurcadrecon(mesh_path: str, output_dir: str, num_epochs: int = 100,
     logger.info(f"Using device: {device}")
     logger.info("Training with normal-based SDF for non-watertight surfaces")
 
-    preprocessor = MeshPreprocessor(mesh_path)
+    preprocessor = MeshPreprocessor(mesh_path, padding=0.05)
     points, normals = preprocessor.load_and_preprocess()
+    logger.info(f"Using padding: {preprocessor.padding:.3f} for training data sampling")
 
     network = NeurCADReconNetwork(
         in_dim=3,
@@ -455,7 +468,7 @@ def train_neurcadrecon(mesh_path: str, output_dir: str, num_epochs: int = 100,
 
     logger.info("Reconstructing mesh using normal-based SDF...")
     reconstructor = MeshReconstructor(network, device)
-    reconstructed_mesh = reconstructor.reconstruct_mesh(resolution=256)
+    reconstructed_mesh = reconstructor.reconstruct_mesh(resolution=256, padding=0.05)
 
     output_mesh_path = os.path.join(output_dir, 'reconstructed_mesh.obj')
     reconstructed_mesh.export(output_mesh_path)
@@ -465,9 +478,9 @@ def train_neurcadrecon(mesh_path: str, output_dir: str, num_epochs: int = 100,
 
 
 def main():
-    input_mesh_path = "/home/mikolaj/Documents/github/inr_voronoi/data/sphylinder/cylinder.obj"
+    input_mesh_path = "/home/mikolaj/Documents/github/inr_voronoi/data/sphylinder/hemisphere.obj"
     output_directory = "/home/mikolaj/Downloads"
-    num_epochs = 500
+    num_epochs = 1000
     learning_rate = 5e-5
     device = 'cuda'
 

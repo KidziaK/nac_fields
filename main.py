@@ -1,33 +1,39 @@
+import os
+import time
+import mcubes
+import numpy as np
+import open3d as o3d
+import scipy.spatial as spatial
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 import trimesh
-import open3d as o3d
-import os
 from tqdm import tqdm
-import mcubes
+from scipy.spatial import cKDTree
+from dataclasses import dataclass
 from typing import Dict, Tuple
-import logging
-import scipy.spatial as spatial
+from pathlib import Path
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
 
+def timeit(func):
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print(f"Function '{func.__name__}' executed in {elapsed_time:.4f} seconds")
+        return result
+    return wrapper
+
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 class Sine(nn.Module):
-    """Sine activation function for SIREN architecture."""
-
     def forward(self, input):
         return torch.sin(30 * input)
 
 
 def sine_init(m):
-    """Initialize weights for SIREN architecture."""
     with torch.no_grad():
         if hasattr(m, 'weight'):
             num_input = m.weight.size(-1)
@@ -35,7 +41,6 @@ def sine_init(m):
 
 
 def first_layer_sine_init(m):
-    """Initialize first layer weights for SIREN architecture."""
     with torch.no_grad():
         if hasattr(m, 'weight'):
             num_input = m.weight.size(-1)
@@ -43,8 +48,6 @@ def first_layer_sine_init(m):
 
 
 class FCBlock(nn.Module):
-    """Fully connected block for SIREN architecture."""
-
     def __init__(self, in_features, out_features, num_hidden_layers, hidden_features,
                  outermost_linear=False, init_type='siren'):
         super().__init__()
@@ -74,8 +77,6 @@ class FCBlock(nn.Module):
 
 
 class AbsLayer(nn.Module):
-    """Self-contained absolute value layer for UDF."""
-
     def __init__(self):
         super(AbsLayer, self).__init__()
 
@@ -84,8 +85,6 @@ class AbsLayer(nn.Module):
 
 
 class Decoder(nn.Module):
-    """Decoder for SIREN architecture."""
-
     def __init__(self, udf=False):
         super(Decoder, self).__init__()
         if udf:
@@ -100,8 +99,6 @@ class Decoder(nn.Module):
 
 
 class NeurCADReconNetwork(nn.Module):
-    """NeurCADRecon network implementation."""
-
     def __init__(self, in_dim=3, decoder_hidden_dim=256, decoder_n_hidden_layers=4, udf=False):
         super().__init__()
 
@@ -115,136 +112,89 @@ class NeurCADReconNetwork(nn.Module):
         )
 
     def forward(self, points):
-        """Forward pass through the network."""
         return self.decoder(points)
 
 
-class MeshPreprocessor:
-    """Handles mesh loading, preprocessing, and sampling."""
+@dataclass
+class TrainingData:
+    surface_points: torch.Tensor
+    surface_normals: torch.Tensor
+    off_surface_points: torch.Tensor
+    near_surface_points: torch.Tensor
 
+class MeshPreprocessor:
     def __init__(self, mesh_path: str, padding: float = 0.05):
         self.mesh_path = mesh_path
         self.padding = padding
-        self.mesh = None
         self.points = None
         self.normals = None
-        self.center = None
+        self.sigmas = None
         self.scale = None
+        self.center = None
 
-    def load_and_preprocess(self) -> Tuple[np.ndarray, np.ndarray]:
-        """Load mesh and preprocess it."""
-        logger.info(f"Loading mesh from {self.mesh_path}")
+    def load_and_preprocess(self) -> None:
+        mesh = o3d.io.read_triangle_mesh(self.mesh_path)
 
-        self.mesh = trimesh.load(self.mesh_path, process=False)
-        if isinstance(self.mesh, trimesh.Scene):
-            self.mesh = trimesh.load(self.mesh_path, process=False, force='mesh')
+        aabb = mesh.get_axis_aligned_bounding_box()
+        center = aabb.get_center()
+        self.center = center
+        mesh.translate(-center)
 
-        points, face_indices = self.mesh.sample(10000, return_index=True)
-        normals = self.mesh.face_normals[face_indices]
+        aabb_centered = mesh.get_axis_aligned_bounding_box()
+        extent = aabb_centered.get_extent()
 
-        self.center = points.mean(axis=0)
-        points = points - self.center[None, :]
-        self.scale = np.abs(points).max()
-        points = points / (self.scale * 2.0)
+        max_dimension = np.max(extent)
+        scale_factor = 1.0 / max_dimension
+        mesh.scale(scale_factor, center=np.array([0.0, 0.0, 0.0]))
+        self.scale = scale_factor
 
-        self.points = points.astype(np.float32)
-        self.normals = normals.astype(np.float32)
+        pcd = mesh.sample_points_poisson_disk(number_of_points=20000)
+        pcd.estimate_normals()
+        pcd.orient_normals_consistent_tangent_plane(5)
 
-        self.estimated_normals = self.estimate_normals_with_open3d(self.points)
+        points_np = np.asarray(pcd.points).astype(np.float32)
 
-        logger.info(f"Preprocessed mesh: {self.points.shape[0]} points, scale: {self.scale:.4f}")
-        return self.points, self.normals
+        kd_tree = cKDTree(points_np)
+        dist, _ = kd_tree.query(points_np, k=51, workers=-1)
+        sigmas = dist[:, -1:].astype(np.float32)
 
-    def estimate_normals_with_open3d(self, points: np.ndarray, k_neighbors: int = 30) -> np.ndarray:
-        """Estimate normals from point cloud using Open3D's built-in method with consistent orientation."""
-        logger.info(f"Estimating normals from {points.shape[0]} points using Open3D")
+        self.sigmas = torch.from_numpy(sigmas).to(DEVICE)
+        self.points = torch.from_numpy(points_np).to(DEVICE)
+        self.normals = torch.from_numpy(np.asarray(pcd.normals).astype(np.float32)).to(DEVICE)
 
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points)
 
-        pcd.estimate_normals(
-            search_param=o3d.geometry.KDTreeSearchParamKNN(knn=k_neighbors)
-        )
-
-        pcd.orient_normals_consistent_tangent_plane(k=k_neighbors)
-        
-        estimated_normals = np.asarray(pcd.normals)
-        
-        logger.info("Open3D normal estimation and consistent orientation completed")
-
-        consistency_score = self.check_normal_consistency(points, estimated_normals, k_neighbors)
-        logger.info(f"Normal consistency score: {consistency_score:.4f}")
-        
-        return estimated_normals.astype(np.float32)
-    
-    def check_normal_consistency(self, points: np.ndarray, normals: np.ndarray, k_neighbors: int = 30) -> float:
-        """
-        Check the consistency of normal orientations across the surface.
-        Returns a score between 0 and 1, where 1 means perfect consistency.
-        """
-        kd_tree = spatial.KDTree(points)
-        n_samples = min(1000, len(points))  # Sample points for efficiency
-        sample_indices = np.random.choice(len(points), n_samples, replace=False)
-
-        consistent_pairs = 0
-        total_pairs = 0
-
-        for idx in sample_indices:
-            distances, neighbor_indices = kd_tree.query(points[idx], k=k_neighbors+1)
-            neighbor_indices = neighbor_indices[1:]  # Exclude self
-
-            for neighbor_idx in neighbor_indices:
-                if np.dot(normals[idx], normals[neighbor_idx]) > 0:
-                    consistent_pairs += 1
-                total_pairs += 1
-
-        return consistent_pairs / total_pairs if total_pairs > 0 else 0.0
-
-    def sample_training_data(self, n_points: int = 20000, use_estimated_normals: bool = True) -> Dict[str, np.ndarray]:
-        """Sample training data including manifold and non-manifold points."""
-
-        manifold_indices = np.random.permutation(self.points.shape[0])
+    def sample_training_data(self, n_points: int = 10000) -> TrainingData:
+        manifold_indices = torch.randperm(len(self.points))
         manifold_idx = manifold_indices[:n_points]
         manifold_points = self.points[manifold_idx]
+        manifold_normals = self.normals[manifold_idx]
 
-        if use_estimated_normals:
-            manifold_normals = self.estimated_normals[manifold_idx]
-        else:
-            manifold_normals = self.normals[manifold_idx]
+        right = 0.5 + self.padding
+        left = -right
 
-        # Sample non-manifold points from the padded cube to match reconstruction grid
-        padded_bounds = 0.5 + self.padding
-        nonmanifold_points = np.random.uniform(-padded_bounds, padded_bounds, size=(n_points, 3)).astype(np.float32)
+        nonmanifold_points = (left - right) * torch.rand(size=(n_points, 3), dtype=torch.float32, device=DEVICE) + right
+        gaussian_noise = torch.randn(size=manifold_points.shape, dtype=torch.float32, device=DEVICE)
+        near_points = manifold_points + self.sigmas[manifold_idx] * gaussian_noise
 
-        kd_tree = spatial.KDTree(self.points)
-        dist, _ = kd_tree.query(self.points, k=51, workers=-1)
-        sigmas = dist[:, -1:]
+        manifold_points.requires_grad_()
+        manifold_normals.requires_grad_()
+        nonmanifold_points.requires_grad_()
+        near_points.requires_grad_()
 
-        near_points = (manifold_points + sigmas[manifold_idx] *
-                       np.random.randn(manifold_points.shape[0], manifold_points.shape[1])).astype(np.float32)
-
-        return {
-            'points': manifold_points,
-            'mnfld_n': manifold_normals,
-            'nonmnfld_points': nonmanifold_points,
-            'near_points': near_points,
-        }
+        return TrainingData(manifold_points, manifold_normals, nonmanifold_points, near_points)
 
 
 class NormalBasedSDFLoss(nn.Module):
-    """SDF loss that uses normals to determine inside/outside for non-watertight surfaces."""
-
     def __init__(self):
         super().__init__()
 
         self.sdf_weight = 7e3
         self.eikonal_weight = 6e2
-        self.orientation_weight = 5e1
-        self.morse_weight = 10
+        self.orientation_weight = 5e2
+        self.near_surface_orientation_weight = 10
         self.gradient_normal_weight = 2e2
 
     def gradient(self, inputs, outputs, create_graph=True, retain_graph=True):
-        """Compute gradients."""
         d_points = torch.ones_like(outputs, requires_grad=False, device=outputs.device)
         points_grad = torch.autograd.grad(
             outputs=outputs,
@@ -255,59 +205,46 @@ class NormalBasedSDFLoss(nn.Module):
             only_inputs=True)[0]
         return points_grad
 
-    def compute_orientation_sign_efficient(self, query_points, surface_points, surface_normals, k_neighbors=1):
-        """
-        Compute the sign for query points using scipy KD-tree for efficiency.
-        Positive sign means the point is on the 'inside' side of the surface.
-        """
+    def compute_orientation_sign(self, query_points, surface_points, surface_normals, k_neighbors=2):
         query_np = query_points.detach().cpu().numpy()
         surface_np = surface_points.detach().cpu().numpy()
         normals_np = surface_normals.detach().cpu().numpy()
 
         kd_tree = spatial.KDTree(surface_np)
-
         distances, indices = kd_tree.query(query_np, k=k_neighbors, workers=-1)
 
-        orientation_signs = []
-        for i, query_point in enumerate(query_np):
-            nearest_surface_points = surface_np[indices[i]]
-            nearest_normals = normals_np[indices[i]]
-            vectors_to_query = query_point - nearest_surface_points
-            dot_products = np.sum(vectors_to_query * nearest_normals, axis=1)
-            avg_dot_product = np.mean(dot_products)
-            orientation_sign = np.sign(avg_dot_product)
-            orientation_signs.append(orientation_sign)
+        nearest_surface_points = surface_np[indices]
+        nearest_normals = normals_np[indices]
 
-        orientation_signs = torch.tensor(orientation_signs, device=query_points.device, dtype=torch.float32)
+        vectors_to_query = query_np[:, np.newaxis, :] - nearest_surface_points
+
+        dot_products = np.sum(vectors_to_query * nearest_normals, axis=2)
+
+        avg_dot_product = np.mean(dot_products, axis=1)
+
+        orientation_signs_np = np.sign(avg_dot_product)
+
+        orientation_signs = torch.tensor(orientation_signs_np, device=query_points.device, dtype=torch.float32)
+
         return orientation_signs
 
-    def compute_orientation_sign(self, query_points, surface_points, surface_normals, k_neighbors=2):
-        """
-        Compute the sign for query points based on their relationship to surface points and normals.
-        Uses efficient KD-tree implementation for better performance.
-        """
-        return self.compute_orientation_sign_efficient(query_points, surface_points, surface_normals, k_neighbors)
-
-    def forward(self, output_pred: Dict[str, torch.Tensor], gt: Dict[str, torch.Tensor]) -> Tuple[
+    def forward(self, output_pred: Dict[str, torch.Tensor], gt: TrainingData) -> Tuple[
         torch.Tensor, Dict[str, torch.Tensor]]:
-        """Compute normal-based SDF loss."""
 
         manifold_pred = output_pred["manifold_pnts_pred"]
         nonmanifold_pred = output_pred["nonmanifold_pnts_pred"]
         near_points_pred = output_pred.get("near_points_pred")
 
-        manifold_points = gt['points']
-        manifold_normals = gt['mnfld_n']
-        nonmanifold_points = gt['nonmnfld_points']
-        near_points = gt.get('near_points')
+        manifold_points = gt.surface_points
+        manifold_normals = gt.surface_normals
+        nonmanifold_points = gt.off_surface_points
+        near_points = gt.near_surface_points
 
         manifold_points.requires_grad_()
         nonmanifold_points.requires_grad_()
-        if near_points is not None:
-            near_points.requires_grad_()
+        near_points.requires_grad_()
 
         manifold_grad = self.gradient(manifold_points, manifold_pred)
-        nonmanifold_grad = self.gradient(nonmanifold_points, nonmanifold_pred)
 
         sdf_loss = torch.mean(manifold_pred ** 2)
         eikonal_loss = torch.mean((torch.norm(manifold_grad, dim=-1) - 1) ** 2)
@@ -316,19 +253,20 @@ class NormalBasedSDFLoss(nn.Module):
             nonmanifold_points, manifold_points, manifold_normals, k_neighbors=2
         )
         target_signs = orientation_signs.unsqueeze(-1)
-        orientation_loss = torch.mean(torch.relu(-nonmanifold_pred * target_signs + 0.1))
+        orientation_loss = torch.mean(torch.relu(-nonmanifold_pred * target_signs))
 
-        morse_loss = torch.tensor(0.0, device=manifold_points.device)
-        if near_points_pred is not None:
-            near_grad = self.gradient(near_points, near_points_pred)
-            morse_loss = torch.mean(torch.relu(-near_points_pred + 0.05))
+        orientation_signs = self.compute_orientation_sign(
+            near_points, manifold_points, manifold_normals, k_neighbors=2
+        )
+        target_signs = orientation_signs.unsqueeze(-1)
+        near_surface_orientation_loss = torch.mean(torch.relu(-near_points_pred * target_signs))
 
         gradient_normal_loss = torch.mean((manifold_grad - manifold_normals) ** 2)
 
         total_loss = (self.sdf_weight * sdf_loss +
                       self.eikonal_weight * eikonal_loss +
                       self.orientation_weight * orientation_loss +
-                      self.morse_weight * morse_loss +
+                      self.near_surface_orientation_weight * near_surface_orientation_loss +
                       self.gradient_normal_weight * gradient_normal_loss)
 
         loss_dict = {
@@ -336,7 +274,7 @@ class NormalBasedSDFLoss(nn.Module):
             'sdf_loss': sdf_loss,
             'eikonal_loss': eikonal_loss,
             'orientation_loss': orientation_loss,
-            'morse_loss': morse_loss,
+            'near_surface_orientation_loss': near_surface_orientation_loss,
             'gradient_normal_loss': gradient_normal_loss
         }
 
@@ -344,15 +282,12 @@ class NormalBasedSDFLoss(nn.Module):
 
 
 class MeshReconstructor:
-    """Handles mesh reconstruction from trained network."""
-
-    def __init__(self, network: NeurCADReconNetwork, device: str = 'cuda'):
+    def __init__(self, network: NeurCADReconNetwork, scale: float, center):
         self.network = network
-        self.device = device
+        self.scale = scale
+        self.center = center
 
     def get_3d_grid(self, resolution: int = 256, padding: float = 0.05) -> Dict[str, torch.Tensor]:
-        """Generate 3D grid for marching cubes with padding to ensure edge reconstruction."""
-        # Add padding to ensure objects on edges are properly reconstructed
         bbox = np.array([[-0.5 - padding, 0.5 + padding], 
                         [-0.5 - padding, 0.5 + padding], 
                         [-0.5 - padding, 0.5 + padding]])
@@ -363,7 +298,7 @@ class MeshReconstructor:
 
         xx, yy, zz = np.meshgrid(x, y, z, indexing='ij')
         grid_points = torch.tensor(np.vstack([xx.ravel(), yy.ravel(), zz.ravel()]).T,
-                                   dtype=torch.float32, device=self.device)
+                                   dtype=torch.float32, device=DEVICE)
 
         return {
             "grid_points": grid_points,
@@ -372,9 +307,6 @@ class MeshReconstructor:
         }
 
     def reconstruct_mesh(self, resolution: int = 256, chunk_size: int = 10000, padding: float = 0.1) -> trimesh.Trimesh:
-        """Reconstruct mesh using marching cubes for SDF."""
-        logger.info(f"Starting mesh reconstruction for SDF with {padding:.3f} padding...")
-
         self.network.eval()
         grid_dict = self.get_3d_grid(resolution=resolution, padding=padding)
         grid_points = grid_dict["grid_points"]
@@ -392,59 +324,45 @@ class MeshReconstructor:
         bbox = grid_dict["bbox"]
         z_grid = z_values.reshape(len(x), len(y), len(z))
 
-        logger.info("Applying marching cubes with threshold 0...")
         vertices, faces = mcubes.marching_cubes(z_grid, 0)
 
-        # Scale vertices to match the padded bbox
         bbox_size = bbox[:, 1] - bbox[:, 0]
-        logger.info(f"Grid bbox: X[{bbox[0, 0]:.3f}, {bbox[0, 1]:.3f}], Y[{bbox[1, 0]:.3f}, {bbox[1, 1]:.3f}], Z[{bbox[2, 0]:.3f}, {bbox[2, 1]:.3f}]")
         vertices = vertices * (bbox_size / resolution)
         vertices = vertices + bbox[:, 0]
+        vertices /= self.scale
+        vertices += self.center
 
         mesh = trimesh.Trimesh(vertices=vertices, faces=faces)
 
-        logger.info(f"Reconstructed mesh: {len(vertices)} vertices, {len(faces)} faces")
         return mesh
 
-
-def train_neurcadrecon(mesh_path: str, output_dir: str, num_epochs: int = 100,
-                       lr: float = 5e-5, device: str = 'cuda'):
-    """Main training function for normal-based SDF reconstruction."""
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    device = torch.device(device if torch.cuda.is_available() else 'cpu')
-    logger.info(f"Using device: {device}")
-    logger.info("Training with normal-based SDF for non-watertight surfaces")
+@timeit
+def train_neurcadrecon(mesh_path: str | Path, output_dir: str, num_epochs: int, lr: float):
+    mesh_path = Path(mesh_path)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     preprocessor = MeshPreprocessor(mesh_path, padding=0.05)
-    points, normals = preprocessor.load_and_preprocess()
-    logger.info(f"Using padding: {preprocessor.padding:.3f} for training data sampling")
+    preprocessor.load_and_preprocess()
 
     network = NeurCADReconNetwork(
         in_dim=3,
         decoder_hidden_dim=256,
         decoder_n_hidden_layers=4,
         udf=False
-    ).to(device)
+    ).to(DEVICE)
 
     optimizer = optim.Adam(network.parameters(), lr=lr, weight_decay=0.0)
     criterion = NormalBasedSDFLoss()
 
-    logger.info("Starting training...")
-
     for epoch in range(num_epochs):
         network.train()
 
-        training_data = preprocessor.sample_training_data(n_points=20000, use_estimated_normals=True)
+        training_data = preprocessor.sample_training_data(n_points=20000)
 
-        for key in training_data:
-            training_data[key] = torch.tensor(training_data[key], device=device, dtype=torch.float32)
-            training_data[key].requires_grad_()
-
-        manifold_pred = network(training_data['points'])
-        nonmanifold_pred = network(training_data['nonmnfld_points'])
-        near_points_pred = network(training_data['near_points'])
+        manifold_pred = network(training_data.surface_points)
+        nonmanifold_pred = network(training_data.off_surface_points)
+        near_points_pred = network(training_data.near_surface_points)
 
         output_pred = {
             "manifold_pnts_pred": manifold_pred,
@@ -460,48 +378,33 @@ def train_neurcadrecon(mesh_path: str, output_dir: str, num_epochs: int = 100,
         optimizer.step()
 
         if epoch % 10 == 0:
-            logger.info(f"Epoch {epoch}/{num_epochs}, Loss: {loss.item():.6f}")
-            logger.info(f"  SDF: {loss_dict['sdf_loss']:.6f}, Eikonal: {loss_dict['eikonal_loss']:.6f}")
-            logger.info(f"  Orientation: {loss_dict['orientation_loss']:.6f}")
+            print(f"Epoch {epoch}/{num_epochs}, Loss: {loss.item():.6f}")
+            print(f"  SDF: {loss_dict['sdf_loss']:.6f}, Eikonal: {loss_dict['eikonal_loss']:.6f}")
+            print(f"  Orientation: {loss_dict['orientation_loss']:.6f}")
 
-    logger.info("Training completed.")
-
-    logger.info("Reconstructing mesh using normal-based SDF...")
-    reconstructor = MeshReconstructor(network, device)
+    reconstructor = MeshReconstructor(network, preprocessor.scale, preprocessor.center)
     reconstructed_mesh = reconstructor.reconstruct_mesh(resolution=256, padding=0.05)
 
-    output_mesh_path = os.path.join(output_dir, 'reconstructed_mesh.obj')
+    output_mesh_path = output_dir / mesh_path.name
     reconstructed_mesh.export(output_mesh_path)
-    logger.info(f"Reconstructed mesh saved to: {output_mesh_path}")
 
     return network, reconstructed_mesh
 
 
-def main():
-    input_mesh_path = "/home/mikolaj/Documents/github/inr_voronoi/data/sphylinder/hemisphere.obj"
+if __name__ == "__main__":
+    input_meshes_paths = [
+        "/home/mikolaj/Documents/github/inr_voronoi/data/sphylinder/hemisphere.obj",
+        "/home/mikolaj/Documents/github/inr_voronoi/data/sphylinder/cylinder.obj",
+        "/home/mikolaj/Documents/github/inr_voronoi/data/sphylinder/disk.obj"
+    ]
     output_directory = "/home/mikolaj/Downloads"
-    num_epochs = 1000
+    num_epochs = 10000
     learning_rate = 5e-5
-    device = 'cuda'
 
-    if not os.path.exists(input_mesh_path):
-        logger.error(f"Input mesh file not found: {input_mesh_path}")
-        return
-
-    try:
-        network, mesh = train_neurcadrecon(
-            mesh_path=input_mesh_path,
+    for input_path in tqdm(input_meshes_paths):
+        train_neurcadrecon(
+            mesh_path=input_path,
             output_dir=output_directory,
             num_epochs=num_epochs,
-            lr=learning_rate,
-            device=device
+            lr=learning_rate
         )
-        logger.info("UDF-based mesh reconstruction completed successfully!")
-
-    except Exception as e:
-        logger.error(f"Error during reconstruction: {e}")
-        raise
-
-
-if __name__ == "__main__":
-    main()

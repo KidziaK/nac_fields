@@ -8,7 +8,4 @@ def show(obj: Any) -> None:
         pcd.points = o3d.utility.Vector3dVector(obj)
         obj = pcd
 
-    if isinstance(obj, o3d.geometry.PointCloud):
-        o3d.visualization.draw_geometries([obj], point_show_normal=True)
-    else:
-        raise NotImplementedError(obj)
+    o3d.visualization.draw_geometries([obj], point_show_normal=True, mesh_show_back_face=True)

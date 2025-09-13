@@ -3,22 +3,27 @@ cimport numpy as np
 cimport cython
 from libc.math cimport sqrt
 
-ctypedef np.float64_t DTYPE_t
+ctypedef np.float32_t DTYPE_t
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
 def find_planar_clusters(np.ndarray[DTYPE_t, ndim=2] points,
+                         np.ndarray[DTYPE_t, ndim=2] normals,
                          double distance_threshold=0.05,
                          int min_points_in_cluster=50,
                          int max_iterations=1000):
     cdef int n_points = points.shape[0]
     if n_points < min_points_in_cluster:
-        return [], points
+        return [], [], points, normals
+
+    if n_points != normals.shape[0] or normals.shape[1] != 3:
+        raise ValueError("Points and normals must have the same Nx3 shape.")
 
     cdef DTYPE_t[:, :] points_view = points
     cdef np.ndarray[np.uint8_t, ndim=1] unclassified_mask = np.ones(n_points, dtype=np.uint8)
 
-    cdef list clusters = []
+    cdef list clusters_points = []
+    cdef list clusters_normals = []
     cdef int i, j
     cdef int p1_idx, p2_idx, p3_idx
     cdef DTYPE_t p1[3], p2[3], p3[3]
@@ -79,12 +84,14 @@ def find_planar_clusters(np.ndarray[DTYPE_t, ndim=2] points,
                 best_inliers_indices = current_inliers_indices
 
         if best_inliers_indices.shape[0] >= min_points_in_cluster:
-            clusters.append(points[best_inliers_indices])
+            clusters_points.append(points[best_inliers_indices])
+            clusters_normals.append(normals[best_inliers_indices])
             unclassified_mask[best_inliers_indices] = 0
         else:
             break
 
     final_unclassified_indices = np.where(unclassified_mask)[0]
     unclassified_points = points[final_unclassified_indices]
+    unclassified_normals = normals[final_unclassified_indices]
 
-    return clusters, unclassified_points
+    return clusters_points, clusters_normals, unclassified_points, unclassified_normals

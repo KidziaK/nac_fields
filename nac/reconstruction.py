@@ -1,8 +1,11 @@
 import mcubes
 import torch
+from scipy.ndimage import zoom
+
 from nac import VoronoiNetwork
 import numpy as np
 import open3d as o3d
+
 
 def reconstruct_mesh(networks: list[VoronoiNetwork] | VoronoiNetwork, resolution: int = 256, batch_size: int = 65536):
     if not isinstance(networks, list):
@@ -19,29 +22,36 @@ def reconstruct_mesh(networks: list[VoronoiNetwork] | VoronoiNetwork, resolution
     grid_np = np.vstack([xx.ravel(), yy.ravel(), zz.ravel()]).T
     grid = torch.tensor(grid_np, dtype=torch.float32, device=device)
 
-    all_sdf_values = torch.zeros(grid.shape[0], device=device)
+    all_sdf_values = torch.zeros(grid.shape[0], device=device, dtype=torch.uint8)
+    udf = 100 * torch.ones(grid.shape[0], device=device, dtype=torch.float32)
 
     with torch.no_grad():
         for i in range(0, grid.shape[0], batch_size):
             batch_points = torch.tensor(grid[i:i + batch_size], dtype=torch.float32, device=device)
+            current_slice = slice(i, i + batch_size)
 
-            all_batch_sdfs = []
             for nn in networks:
                 nn.eval()
                 sdf = nn(batch_points)
-                all_batch_sdfs.append(sdf)
-
-            stacked_sdfs = torch.stack(all_batch_sdfs)
-            min_sdf, _ = torch.min(stacked_sdfs, dim=0)
-            all_sdf_values[i:i + batch_size] = min_sdf.squeeze()
+                all_sdf_values[current_slice] += torch.where(sdf < 0, 1, 0).squeeze()
+                udf[current_slice] = torch.minimum(udf[current_slice], torch.abs(sdf.squeeze()))
 
     sdf_volume = all_sdf_values.reshape(resolution, resolution, resolution)
+    udf_volume = udf.reshape(resolution, resolution, resolution)
+    sdf_volume = torch.where(sdf_volume == sdf_volume.max(), -udf_volume, udf_volume)
 
     sdf_np = sdf_volume.cpu().numpy()
 
-    vertices, faces = mcubes.marching_cubes(sdf_np, 0)
+    zoom_factor = 1
+    vertices, faces = mcubes.marching_cubes(zoom(sdf_np, zoom_factor, order=3), 0)
 
     mesh = o3d.geometry.TriangleMesh()
+
+    a = 0.51
+    bbox = np.array([[-a, a], [-a, a], [-a, a]])
+    bbox_size = bbox[:, 1] - bbox[:, 0]
+    vertices = vertices * (bbox_size / resolution) / zoom_factor
+    vertices = vertices + bbox[:, 0]
 
     mesh.vertices = o3d.utility.Vector3dVector(vertices)
     mesh.triangles = o3d.utility.Vector3iVector(faces)

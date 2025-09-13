@@ -40,7 +40,7 @@ class DataSampler:
 
     def sample(self) -> TrainingData:
         n = len(self.points)
-        n_points = self.config.surface_points_count
+        n_points = min(self.config.surface_points_count, n)
         device = self.config.device
 
         manifold_indices = torch.randperm(n)

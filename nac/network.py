@@ -1,6 +1,6 @@
 import torch
-from torch import nn, optim
 import numpy as np
+from torch import nn, optim, Tensor
 from tqdm import tqdm
 from .data import TrainingConfig, DataSampler
 from .loss import NormalBasedSDFLoss
@@ -26,11 +26,9 @@ def first_layer_sine_init(m):
 
 
 class FCBlock(nn.Module):
-    def __init__(self, in_features, out_features, num_hidden_layers, hidden_features,
-                 outermost_linear=False, init_type='siren'):
+    def __init__(self, in_features, out_features, num_hidden_layers, hidden_features):
         super().__init__()
 
-        self.init_type = init_type
         nl = Sine()
 
         self.net = []
@@ -39,58 +37,30 @@ class FCBlock(nn.Module):
         for i in range(num_hidden_layers):
             self.net.append(nn.Sequential(nn.Linear(hidden_features, hidden_features), nl))
 
-        if outermost_linear:
-            self.net.append(nn.Sequential(nn.Linear(hidden_features, out_features)))
-        else:
-            self.net.append(nn.Sequential(nn.Linear(hidden_features, out_features), nl))
+        self.net.append(nn.Sequential(nn.Linear(hidden_features, out_features)))
 
         self.net = nn.Sequential(*self.net)
 
-        if init_type == 'siren':
-            self.net.apply(sine_init)
-            self.net[0].apply(first_layer_sine_init)
+        self.net.apply(sine_init)
+        self.net[0].apply(first_layer_sine_init)
 
     def forward(self, coords):
         return self.net(coords)
 
 
-class AbsLayer(nn.Module):
-    def __init__(self):
-        super(AbsLayer, self).__init__()
-
-    def forward(self, x):
-        return torch.abs(x)
-
-
-class Decoder(nn.Module):
-    def __init__(self, udf=False):
-        super(Decoder, self).__init__()
-        if udf:
-            self.nl = AbsLayer()
-        else:
-            self.nl = nn.Identity()
-
-    def forward(self, coords):
-        res = self.fc_block(coords)
-        res = self.nl(res)
-        return res
-
-
 class VoronoiNetwork(nn.Module):
-    def __init__(self, in_dim: int = 3, decoder_hidden_dim: int = 256, decoder_n_hidden_layers:int = 4) -> None:
+    def __init__(self, in_dim: int = 3, decoder_hidden_dim: int = 256, decoder_n_hidden_layers:int = 4):
         super().__init__()
 
-        self.decoder = Decoder(udf=False)
-        self.decoder.fc_block = FCBlock(
-            in_dim, 1,
+        self.fc_block = FCBlock(
+            in_dim,
+            1,
             num_hidden_layers=decoder_n_hidden_layers,
-            hidden_features=decoder_hidden_dim,
-            outermost_linear=True,
-            init_type='siren'
+            hidden_features=decoder_hidden_dim
         )
 
-    def forward(self, points):
-        return self.decoder(points)
+    def forward(self, points: Tensor) -> Tensor:
+        return self.fc_block(points)
 
     def train_point_cloud(self, config: TrainingConfig, data_sampler: DataSampler):
         optimizer = optim.Adam(self.parameters(), lr=config.learning_rate)
@@ -113,11 +83,12 @@ class VoronoiNetwork(nn.Module):
                 "near_points_pred": near_points_pred
             }
 
-            loss, loss_dict = criterion(output_pred, training_data)
+            loss_dict = criterion(output_pred, training_data)
+            loss = loss_dict["loss"]
 
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.parameters(), 10.0)
             optimizer.step()
 
-            progress_bar.set_postfix({'loss': loss.item()})
+            progress_bar.set_postfix({loss_name: loss_value.item() for loss_name, loss_value in loss_dict.items()})

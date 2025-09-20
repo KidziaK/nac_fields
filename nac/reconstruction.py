@@ -2,44 +2,14 @@ import mcubes
 import torch
 import numpy as np
 import open3d as o3d
-from scipy.ndimage import zoom
+from scipy.spatial import cKDTree
 from nac import VoronoiNetwork
-
-
-def transform_mesh_to_aabb(
-        mesh: o3d.geometry.TriangleMesh,
-        new_aabb: o3d.geometry.AxisAlignedBoundingBox
-) -> o3d.geometry.TriangleMesh:
-    original_aabb = mesh.get_axis_aligned_bounding_box()
-    original_min = original_aabb.min_bound
-    original_max = original_aabb.max_bound
-    original_extents = original_max - original_min
-
-    new_min = new_aabb.min_bound
-    new_max = new_aabb.max_bound
-    new_extents = new_max - new_min
-
-    scale_factor = new_extents / original_extents
-
-    translation_vector = new_min - original_min
-
-    T = np.identity(4)
-    S = np.identity(4)
-    S[:3, :3] = np.diag(scale_factor)
-    T[:3, 3] = translation_vector
-
-    transform_matrix = T @ S
-
-    transformed_mesh = mesh.transform(transform_matrix)
-
-    return transformed_mesh
 
 
 def reconstruct_mesh(
         networks: list[VoronoiNetwork] | VoronoiNetwork,
         resolution: int = 256,
         batch_size: int = 65536,
-        aabb: o3d.geometry.AxisAlignedBoundingBox | None = None
 ) -> o3d.geometry.TriangleMesh:
     if not isinstance(networks, list):
         networks = [networks]
@@ -75,23 +45,42 @@ def reconstruct_mesh(
 
     sdf_np = sdf_volume.cpu().numpy()
 
-    zoom_factor = 1
-    vertices, faces = mcubes.marching_cubes(zoom(sdf_np, zoom_factor, order=3), 0)
+    vertices, faces = mcubes.marching_cubes(sdf_np, 0)
 
     mesh = o3d.geometry.TriangleMesh()
 
-    a = 0.51
+    a = 0.50
     bbox = np.array([[-a, a], [-a, a], [-a, a]])
     bbox_size = bbox[:, 1] - bbox[:, 0]
-    vertices = vertices * (bbox_size / resolution) / zoom_factor
+    vertices = vertices * (bbox_size / resolution)
     vertices = vertices + bbox[:, 0]
 
     mesh.vertices = o3d.utility.Vector3dVector(vertices)
     mesh.triangles = o3d.utility.Vector3iVector(faces)
 
-    if aabb:
-        mesh = transform_mesh_to_aabb(mesh, aabb)
-
     mesh.compute_vertex_normals()
+
+    return mesh
+
+
+def prune(mesh: o3d.geometry.TriangleMesh, pcd: o3d.geometry.PointCloud, k: int = 5) -> o3d.geometry.TriangleMesh:
+    pcd_points = np.asarray(pcd.points)
+    kdtree = cKDTree(pcd_points)
+
+    closest_pcd_dist, _ = kdtree.query(pcd_points, k=k)
+    max_neighbor_dist = np.max(closest_pcd_dist)
+
+    vertices = np.asarray(mesh.vertices)
+    distances, _ = kdtree.query(vertices, k=k)
+    mean_distances = np.max(distances, axis=1)
+
+    vertices_to_remove_mask = mean_distances > max_neighbor_dist
+    vertex_indices_to_remove = np.where(vertices_to_remove_mask)[0]
+
+    if vertex_indices_to_remove.size > 0:
+        triangles = np.asarray(mesh.triangles)
+        triangles_to_remove_mask = np.any(np.isin(triangles, vertex_indices_to_remove), axis=1)
+        mesh.remove_triangles_by_mask(triangles_to_remove_mask)
+        mesh.remove_unreferenced_vertices()
 
     return mesh

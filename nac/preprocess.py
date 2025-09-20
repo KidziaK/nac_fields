@@ -2,7 +2,7 @@ import open3d as o3d
 import numpy as np
 
 
-def preprocess_mesh(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.AxisAlignedBoundingBox:
+def preprocess_mesh(mesh: o3d.geometry.TriangleMesh) -> tuple[np.ndarray, np.ndarray]:
     aabb = mesh.get_axis_aligned_bounding_box()
     center = aabb.get_center()
     mesh.translate(-center)
@@ -14,4 +14,4 @@ def preprocess_mesh(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.AxisAligned
     scale_factor = 1.0 / max_dimension
     mesh.scale(scale_factor, center=np.array([0.0, 0.0, 0.0]))
 
-    return aabb
+    return center, scale_factor

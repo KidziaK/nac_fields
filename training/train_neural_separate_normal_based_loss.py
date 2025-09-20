@@ -5,10 +5,12 @@ from nac.metrics import chamfer_distance, ChamferDistanceMethod
 from nac.reconstruction import reconstruct_mesh
 
 if __name__ == "__main__":
+    gt_name = "sphylinder"
+    data_path = Path(__file__).parents[1] / "data" / gt_name
+    parts = ["disk", "cylinder", "hemisphere"]
+
     inputs = [
-        Path("/home/mikolaj/Documents/github/inr_voronoi/data/sphylinder/cylinder.obj"),
-        Path("/home/mikolaj/Documents/github/inr_voronoi/data/sphylinder/disk.obj"),
-        Path("/home/mikolaj/Documents/github/inr_voronoi/data/sphylinder/hemisphere.obj")
+        data_path / f"{p}.obj" for p in parts
     ]
 
     config = TrainingConfig()
@@ -27,7 +29,7 @@ if __name__ == "__main__":
         nn.to(config.device)
         nn.train_point_cloud(config, data_sampler)
 
-        reconstruction = reconstruct_mesh(nn, aabb)
+        reconstruction = reconstruct_mesh(nn, aabb=aabb)
 
         print(f"{input_path.stem} chamfer distance l1: {chamfer_distance(mesh, reconstruction)}")
         print(f"{input_path.stem} chamfer distance l2: {chamfer_distance(mesh, reconstruction, method=ChamferDistanceMethod.L2)}")

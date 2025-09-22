@@ -49,7 +49,7 @@ def reconstruct_mesh(
 
     mesh = o3d.geometry.TriangleMesh()
 
-    a = 0.50
+    a = 0.51
     bbox = np.array([[-a, a], [-a, a], [-a, a]])
     bbox_size = bbox[:, 1] - bbox[:, 0]
     vertices = vertices * (bbox_size / resolution)
@@ -63,18 +63,18 @@ def reconstruct_mesh(
     return mesh
 
 
-def prune(mesh: o3d.geometry.TriangleMesh, pcd: o3d.geometry.PointCloud, k: int = 5) -> o3d.geometry.TriangleMesh:
+def prune(mesh: o3d.geometry.TriangleMesh, pcd: o3d.geometry.PointCloud) -> o3d.geometry.TriangleMesh:
     pcd_points = np.asarray(pcd.points)
     kdtree = cKDTree(pcd_points)
 
-    closest_pcd_dist, _ = kdtree.query(pcd_points, k=k)
-    max_neighbor_dist = np.max(closest_pcd_dist)
+    nearest_neighbors = pcd.compute_nearest_neighbor_distance()
+    max_pair_wise_distances = np.max(nearest_neighbors)
 
     vertices = np.asarray(mesh.vertices)
-    distances, _ = kdtree.query(vertices, k=k)
-    mean_distances = np.max(distances, axis=1)
+    distances, _ = kdtree.query(vertices, k=3)
+    mean_distances = np.mean(distances, axis=1)
 
-    vertices_to_remove_mask = mean_distances > max_neighbor_dist
+    vertices_to_remove_mask = mean_distances > max_pair_wise_distances
     vertex_indices_to_remove = np.where(vertices_to_remove_mask)[0]
 
     if vertex_indices_to_remove.size > 0:

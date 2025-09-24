@@ -3,11 +3,11 @@ import torch
 import numpy as np
 import open3d as o3d
 from scipy.spatial import cKDTree
-from nac import VoronoiNetwork
+from nac import Siren
 
 
 def reconstruct_mesh(
-        networks: list[VoronoiNetwork] | VoronoiNetwork,
+        networks: list[Siren] | Siren,
         resolution: int = 256,
         batch_size: int = 65536,
 ) -> o3d.geometry.TriangleMesh:

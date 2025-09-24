@@ -1,22 +1,16 @@
 import torch
 import numpy as np
-from typing import Dict
+import torch.nn.functional as F
+from enum import auto, Enum
 from scipy import spatial
-from torch import nn
-from .data import TrainingData
 from torch import Tensor
+from torch import mean, abs, exp, norm
 
 
-def compute_gradient(inputs: Tensor, outputs: Tensor) -> Tensor:
-    d_points = torch.ones_like(outputs, requires_grad=False, device=outputs.device)
-    points_grad = torch.autograd.grad(
-        outputs=outputs,
-        inputs=inputs,
-        grad_outputs=d_points,
-        create_graph=True,
-        retain_graph=True,
-        only_inputs=True)[0]
-    return points_grad
+class SampleDirection(Enum):
+    POSITIVE = auto()
+    NEGATIVE = auto()
+    BOTH = auto()
 
 
 def compute_orientation_sign(query_points: Tensor, surface_points: Tensor, surface_normals: Tensor) -> Tensor:
@@ -43,59 +37,97 @@ def compute_orientation_sign(query_points: Tensor, surface_points: Tensor, surfa
     return orientation_signs
 
 
-class NormalBasedSDFLoss(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.sdf_weight = 7e3
-        self.eikonal_weight = 6e2
-        self.orientation_weight = 5e2
-        self.near_surface_orientation_weight = 10
-        self.gradient_normal_weight = 2e2
+def manifold_loss(x: Tensor) -> Tensor:
+    integrand = abs(x)
+    return mean(integrand)
 
 
-    def forward(self, output_pred: Dict[str, Tensor], training_data: TrainingData) -> Dict[str, Tensor]:
-        manifold_pred = output_pred["manifold_pnts_pred"]
-        nonmanifold_pred = output_pred["nonmanifold_pnts_pred"]
-        near_points_pred = output_pred.get("near_points_pred")
+def non_manifold_loss(x: Tensor, alpha: float) -> Tensor:
+    integrand = exp(-alpha * abs(x))
+    return mean(integrand)
 
-        manifold_points = training_data.surface_points
-        manifold_normals = training_data.surface_normals
-        nonmanifold_points = training_data.off_surface_points
-        near_points = training_data.near_surface_points
 
-        manifold_points.requires_grad_()
-        nonmanifold_points.requires_grad_()
-        near_points.requires_grad_()
+def eikonal_loss(dx: Tensor) -> Tensor:
+    integrand = (norm(dx, dim=1) - 1) ** 2
+    return mean(integrand)
 
-        manifold_grad = compute_gradient(manifold_points, manifold_pred)
 
-        sdf_loss = torch.mean(manifold_pred ** 2)
-        eikonal_loss = torch.mean((torch.norm(manifold_grad, dim=-1) - 1) ** 2)
+def sample_shell(
+        model,
+        x_surf: torch.Tensor,
+        d_offset: float,
+        d_direction: SampleDirection = SampleDirection.BOTH,
+        n_shell: int | None = None,
+):
+    if n_shell is None:
+        n_shell = x_surf.shape[0]
 
-        orientation_signs = compute_orientation_sign(nonmanifold_points, manifold_points, manifold_normals)
-        target_signs = orientation_signs.unsqueeze(-1)
-        orientation_loss = torch.mean(torch.relu(-nonmanifold_pred * target_signs))
+    # ------------- pick random subset and enable grad for ∇f -------------
+    idx = torch.randperm(x_surf.size(0), device=x_surf.device)[:n_shell]
+    x_s = x_surf[idx].detach().requires_grad_(True)  # (M,3)
 
-        orientation_signs = compute_orientation_sign(near_points, manifold_points, manifold_normals)
-        target_signs = orientation_signs.unsqueeze(-1)
-        near_surface_orientation_loss = torch.mean(torch.relu(-near_points_pred * target_signs))
+    # ------------- compute unit normals n = ∇f / ‖∇f‖ --------------------
+    fval = model(x_s).sum()
+    n = torch.autograd.grad(fval, x_s, create_graph=True)[0]
+    n = F.normalize(n, dim=-1, eps=1e-9)
 
-        gradient_normal_loss = torch.mean((manifold_grad - manifold_normals) ** 2)
+    # ------------- random orthonormal tangents u, v ----------------------
+    rand = torch.randn_like(n)
+    u = F.normalize(rand - (rand * n).sum(-1, keepdim=True) * n, dim=-1)
+    v = F.normalize(torch.cross(n, u, dim=-1), dim=-1)
 
-        total_loss = (self.sdf_weight * sdf_loss +
-                      self.eikonal_weight * eikonal_loss +
-                      self.orientation_weight * orientation_loss +
-                      self.near_surface_orientation_weight * near_surface_orientation_loss +
-                      self.gradient_normal_weight * gradient_normal_loss)
+    # ------------- shell point  x + d n  with  d ∈ (0,d_offset] ----------
+    match d_direction:
+        case SampleDirection.POSITIVE:
+            d = torch.empty(n_shell, 1, device=x_s.device).uniform_(0.0, d_offset)
+        case SampleDirection.NEGATIVE:
+            d = -torch.empty(n_shell, 1, device=x_s.device).uniform_(0.0, d_offset)
+        case SampleDirection.BOTH:
+            d = torch.empty(n_shell, 1, device=x_s.device).uniform_(-d_offset, d_offset)
+        case _:
+            raise ValueError(f"Invalid d_direction: {d_direction}. Choose from 'positive', 'negative', or 'both'.")
 
-        loss_dict = {
-            'loss': total_loss,
-            'sdf_loss': sdf_loss,
-            'eikonal_loss': eikonal_loss,
-            'orientation_loss': orientation_loss,
-            'near_surface_orientation_loss': near_surface_orientation_loss,
-            'gradient_normal_loss': gradient_normal_loss
-        }
+    x_w = x_s + d * n # (M,3)
 
-        return loss_dict
+    return x_w.detach(), u.detach(), v.detach()
+
+
+def first_order_morse_loss(
+        model,
+        x_surf: torch.Tensor,
+        d_offset: float = 0.05,
+        h_step: float = 0.02,
+        central: bool = False,
+        d_direction: SampleDirection = SampleDirection.BOTH,
+        n_shell: int | None = None,
+):
+    if h_step is None:
+        h_step = d_offset
+
+    # ---------- sample shell Ω_t (normal offset only uses d_offset) -------
+    x_w, u, v = sample_shell(model, x_surf, d_offset, d_direction=d_direction, n_shell=n_shell)
+    M = x_w.shape[0]
+
+    # ---------- helper that enforces finite model output ------------------
+    def f(pts: torch.Tensor):
+        y = model(pts.view(-1, 3)).reshape(-1)
+        return y
+
+    # ---------- one-sided mixed stencil using step size h -----------------
+    f00 = f(x_w)
+    fu = f(x_w + h_step * u)
+    fv = f(x_w + h_step * v)
+    fuv = f(x_w + h_step * (u + v))
+
+    Duv = (fuv - fu - fv + f00) / (h_step * h_step)
+    loss = Duv.abs()  # (M,)
+
+    # ---------- optional central (±h) correction --------------------------
+    if central:
+        fu_m = f(x_w - h_step * u)
+        fv_m = f(x_w - h_step * v)
+        fuv_m = f(x_w - h_step * (u + v))
+        Duv_m = (fuv_m - fu_m - fv_m + f00) / (h_step * h_step)
+        loss = 0.5 * (Duv + Duv_m).abs()
+
+    return loss.mean()

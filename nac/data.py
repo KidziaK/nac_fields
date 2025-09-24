@@ -10,10 +10,10 @@ class TrainingConfig:
     device: torch.device = "cuda" if torch.cuda.is_available() else "cpu"
     epochs: int = 10000
     learning_rate: float = 5e-5
-    padding: float = 0.05
+    padding: float = 0.01
     surface_points_count: int = 10000
-    off_surface_points_count: int = 10000
-    near_surface_points_count: int = 10000
+    off_surface_points_count: int = 20000
+    near_surface_points_count: int = 20000
 
 
 @dataclass

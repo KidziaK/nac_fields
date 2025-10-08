@@ -2,7 +2,7 @@ import open3d as o3d
 import numpy as np
 
 
-def preprocess_mesh(mesh: o3d.geometry.TriangleMesh) -> tuple[np.ndarray, np.ndarray]:
+def preprocess_mesh(mesh: o3d.geometry.TriangleMesh) -> o3d.geometry.TriangleMesh:
     aabb = mesh.get_axis_aligned_bounding_box()
     center = aabb.get_center()
     mesh.translate(-center)
@@ -11,7 +11,7 @@ def preprocess_mesh(mesh: o3d.geometry.TriangleMesh) -> tuple[np.ndarray, np.nda
     extent = aabb_centered.get_extent()
 
     max_dimension = np.max(extent)
-    scale_factor = 1.0 / max_dimension
+    scale_factor = 2 / max_dimension
     mesh.scale(scale_factor, center=np.array([0.0, 0.0, 0.0]))
 
-    return center, scale_factor
+    return mesh

@@ -1,63 +1,48 @@
 import torch
 import open3d as o3d
 import numpy as np
-from dataclasses import dataclass
+from torch import Tensor
+from nac.visualization import show
+from nac.settings import ReconstructionConfig
 from scipy.spatial import cKDTree
-
-
-@dataclass
-class TrainingConfig:
-    device: torch.device = "cuda" if torch.cuda.is_available() else "cpu"
-    epochs: int = 10000
-    learning_rate: float = 5e-5
-    padding: float = 0.01
-    surface_points_count: int = 10000
-    off_surface_points_count: int = 20000
-    near_surface_points_count: int = 20000
-
+from dataclasses import dataclass
 
 @dataclass
 class TrainingData:
-    surface_points: torch.Tensor
-    surface_normals: torch.Tensor
-    off_surface_points: torch.Tensor
-    near_surface_points: torch.Tensor
+    on_manifold_points: Tensor
+    off_manifold_points: Tensor
+    near_manifold_points: Tensor
 
-
-class DataSampler:
-    def __init__(self, point_cloud: o3d.geometry.PointCloud, config: TrainingConfig):
+class SirenDataset:
+    def __init__(self, config: ReconstructionConfig, point_cloud: o3d.geometry.PointCloud):
         self.config = config
-        self.points = np.asarray(point_cloud.points).astype(np.float32)
-        self.normals = np.asarray(point_cloud.normals).astype(np.float32)
+        points = np.asarray(point_cloud.points).astype(np.float32)
+        normals = np.asarray(point_cloud.normals).astype(np.float32)
 
-        kd_tree = cKDTree(self.points)
-        dist, _ = kd_tree.query(self.points, k=51, workers=-1)
+        kd_tree = cKDTree(points)
+        dist, _ = kd_tree.query(points, k=51, workers=-1)
         sigmas = dist[:, -1:].astype(np.float32)
 
         self.sigmas = torch.from_numpy(sigmas).to(config.device)
-        self.points = torch.from_numpy(self.points).to(config.device)
-        self.normals = torch.from_numpy(self.normals).to(config.device)
+        self.points = torch.from_numpy(points).to(config.device)
+        self.normals = torch.from_numpy(normals).to(config.device)
 
     def sample(self) -> TrainingData:
-        n = len(self.points)
-        n_points = min(self.config.surface_points_count, n)
+        n = self.config.samples
         device = self.config.device
 
-        manifold_indices = torch.randperm(n)
-        manifold_idx = manifold_indices[:n_points]
-        manifold_points = self.points[manifold_idx]
-        manifold_normals = self.normals[manifold_idx]
+        random_indices = torch.randperm(len(self.points))[:n]
+        on_manifold_points = self.points[random_indices].to(device)
 
-        right = 0.5 + self.config.padding
-        left = -right
+        off_manifold_points = 2 * (torch.rand(size=(n, 3)) -0.5).to(device)
+        near_manifold_points = torch.normal(mean=on_manifold_points, std=self.sigmas[random_indices]).to(device)
 
-        nonmanifold_points = (left - right) * torch.rand(size=(n_points, 3), dtype=torch.float32, device=device) + right
-        gaussian_noise = torch.randn(size=manifold_points.shape, dtype=torch.float32, device=device)
-        near_points = manifold_points + self.sigmas[manifold_idx] * gaussian_noise
+        on_manifold_points.requires_grad = True
+        off_manifold_points.requires_grad = True
+        near_manifold_points.requires_grad = True
 
-        manifold_points.requires_grad_()
-        manifold_normals.requires_grad_()
-        nonmanifold_points.requires_grad_()
-        near_points.requires_grad_()
-
-        return TrainingData(manifold_points, manifold_normals, nonmanifold_points, near_points)
+        return TrainingData(
+            on_manifold_points=on_manifold_points,
+            off_manifold_points=off_manifold_points,
+            near_manifold_points=near_manifold_points
+        )

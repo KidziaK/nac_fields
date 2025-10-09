@@ -79,7 +79,7 @@ class FlatCAD(Siren):
         self.orientation_weight = 5e2
 
     def train_point_cloud(self, config: TrainingConfig, dataset: SirenDataset):
-        optimizer = optim.Adam(self.parameters(), lr=config.learning_rate)
+        optimizer = optim.Adam(self.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
         self.train()
         self.to(config.device)
 
@@ -90,16 +90,18 @@ class FlatCAD(Siren):
             off_manifold_points = data.off_manifold_points
             near_manifold_points = data.near_manifold_points
             on_manifold_normals = data.on_manifold_normals
+            original_on_manifold_points = data.original_on_manifold_points
 
             on_manifold_sdf = self(on_manifold_points)
             off_manifold_sdf = self(off_manifold_points)
             near_manifold_sdf = self(near_manifold_points)
+            original_on_manifold_sdf = self(original_on_manifold_points)
 
             on_manifold_grad = compute_gradient(on_manifold_points, on_manifold_sdf)
             off_manifold_grad = compute_gradient(off_manifold_points, off_manifold_sdf)
             near_manifold_grad = compute_gradient(near_manifold_points, near_manifold_sdf)
 
-            on_manifold_term = manifold_loss(on_manifold_sdf)
+            on_manifold_term = manifold_loss(on_manifold_sdf) + manifold_loss(original_on_manifold_sdf + dataset.offset)
             off_manifold_term = non_manifold_loss(off_manifold_sdf, alpha=config.non_manifold_alpha)
             eikonal_term = eikonal_loss(on_manifold_grad) + eikonal_loss(off_manifold_grad) + eikonal_loss(near_manifold_grad)
             normal_term = manifold_loss(on_manifold_normals - on_manifold_grad)

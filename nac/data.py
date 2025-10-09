@@ -12,6 +12,7 @@ class TrainingData:
     off_manifold_points: Tensor
     near_manifold_points: Tensor
     on_manifold_normals: Tensor
+    original_on_manifold_points: Tensor
 
 class SirenDataset:
     def __init__(self, config: ReconstructionConfig, point_cloud: o3d.geometry.PointCloud):
@@ -25,7 +26,9 @@ class SirenDataset:
 
         self.sigmas = torch.from_numpy(sigmas).to(config.device)
         self.normals = torch.from_numpy(normals).to(config.device)
-        self.points = torch.from_numpy(points).to(config.device) + config.offset * self.normals
+        self.original_points = torch.from_numpy(points).to(config.device)
+        self.points = self.original_points + config.offset * self.normals
+        self.offset = config.offset
 
     def sample(self) -> TrainingData:
         n = self.config.samples
@@ -34,6 +37,7 @@ class SirenDataset:
         random_indices = torch.randperm(len(self.points))[:n]
         on_manifold_points = self.points[random_indices].to(device)
         on_manifold_normals = self.normals[random_indices].to(device)
+        original_on_manifold_points = self.original_points[random_indices].to(device)
 
         off_manifold_points = self.config.bounding_box_extent * 2 * (torch.rand(size=(3 * n, 3)) -0.5).to(device)
         near_manifold_points = torch.normal(mean=on_manifold_points, std=self.sigmas[random_indices]).to(device)
@@ -42,10 +46,12 @@ class SirenDataset:
         off_manifold_points.requires_grad = True
         near_manifold_points.requires_grad = True
         on_manifold_normals.requires_grad = True
+        original_on_manifold_points.requires_grad = True
 
         return TrainingData(
             on_manifold_points=on_manifold_points,
             off_manifold_points=off_manifold_points,
             near_manifold_points=near_manifold_points,
-            on_manifold_normals=on_manifold_normals
+            on_manifold_normals=on_manifold_normals,
+            original_on_manifold_points=original_on_manifold_points
         )

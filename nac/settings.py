@@ -5,6 +5,7 @@ class TrainingConfig(BaseModel):
     device: str = "cuda"
     epochs: int = 10000
     learning_rate: float = 5e-5
+    weight_decay: float = 1e-5
     gradient_clip: float = 10.0
     non_manifold_alpha: float = 100.0
 

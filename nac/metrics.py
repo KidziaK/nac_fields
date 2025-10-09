@@ -2,6 +2,7 @@ import numpy as np
 import open3d as o3d
 from enum import Enum, auto
 
+
 class ChamferDistanceMethod(Enum):
     L1 = auto()
     L2 = auto()

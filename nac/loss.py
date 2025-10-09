@@ -13,6 +13,18 @@ class SampleDirection(Enum):
     BOTH = auto()
 
 
+def compute_gradient(inputs: Tensor, outputs: Tensor) -> Tensor:
+    d_points = torch.ones_like(outputs, requires_grad=False, device=outputs.device)
+    points_grad = torch.autograd.grad(
+        outputs=outputs,
+        inputs=inputs,
+        grad_outputs=d_points,
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True)[0]
+    return points_grad
+
+
 def compute_orientation_sign(query_points: Tensor, surface_points: Tensor, surface_normals: Tensor) -> Tensor:
     query_np = query_points.detach().cpu().numpy()
     surface_np = surface_points.detach().cpu().numpy()
@@ -37,6 +49,12 @@ def compute_orientation_sign(query_points: Tensor, surface_points: Tensor, surfa
     return orientation_signs
 
 
+def orientation_loss(query_points: Tensor, on_manifold_points: Tensor, on_manifold_normals: Tensor) -> Tensor:
+    orientation_signs = compute_orientation_sign(query_points, on_manifold_points, on_manifold_normals)
+    target_signs = orientation_signs.unsqueeze(-1)
+    return torch.mean(torch.relu(-query_points * target_signs))
+
+
 def manifold_loss(x: Tensor) -> Tensor:
     integrand = abs(x)
     return mean(integrand)
@@ -48,86 +66,53 @@ def non_manifold_loss(x: Tensor, alpha: float) -> Tensor:
 
 
 def eikonal_loss(dx: Tensor) -> Tensor:
-    integrand = (norm(dx, dim=1) - 1) ** 2
+    integrand = abs(norm(dx, dim=1) - 1)
     return mean(integrand)
 
 
-def sample_shell(
-        model,
-        x_surf: torch.Tensor,
-        d_offset: float,
-        d_direction: SampleDirection = SampleDirection.BOTH,
-        n_shell: int | None = None,
-):
-    if n_shell is None:
-        n_shell = x_surf.shape[0]
+def optimized_finite_proxy_loss(x, y, u, v, h_step, model):
+    """
+    Optimized version that reduces network calls from 6 to 4
+    by using a more efficient finite difference stencil
+    """
 
-    # ------------- pick random subset and enable grad for ∇f -------------
-    idx = torch.randperm(x_surf.size(0), device=x_surf.device)[:n_shell]
-    x_s = x_surf[idx].detach().requires_grad_(True)  # (M,3)
-
-    # ------------- compute unit normals n = ∇f / ‖∇f‖ --------------------
-    fval = model(x_s).sum()
-    n = torch.autograd.grad(fval, x_s, create_graph=True)[0]
-    n = F.normalize(n, dim=-1, eps=1e-9)
-
-    # ------------- random orthonormal tangents u, v ----------------------
-    rand = torch.randn_like(n)
-    u = F.normalize(rand - (rand * n).sum(-1, keepdim=True) * n, dim=-1)
-    v = F.normalize(torch.cross(n, u, dim=-1), dim=-1)
-
-    # ------------- shell point  x + d n  with  d ∈ (0,d_offset] ----------
-    match d_direction:
-        case SampleDirection.POSITIVE:
-            d = torch.empty(n_shell, 1, device=x_s.device).uniform_(0.0, d_offset)
-        case SampleDirection.NEGATIVE:
-            d = -torch.empty(n_shell, 1, device=x_s.device).uniform_(0.0, d_offset)
-        case SampleDirection.BOTH:
-            d = torch.empty(n_shell, 1, device=x_s.device).uniform_(-d_offset, d_offset)
-        case _:
-            raise ValueError(f"Invalid d_direction: {d_direction}. Choose from 'positive', 'negative', or 'both'.")
-
-    x_w = x_s + d * n # (M,3)
-
-    return x_w.detach(), u.detach(), v.detach()
-
-
-def first_order_morse_loss(
-        model,
-        x_surf: torch.Tensor,
-        d_offset: float = 0.05,
-        h_step: float = 0.02,
-        central: bool = False,
-        d_direction: SampleDirection = SampleDirection.BOTH,
-        n_shell: int | None = None,
-):
-    if h_step is None:
-        h_step = d_offset
-
-    # ---------- sample shell Ω_t (normal offset only uses d_offset) -------
-    x_w, u, v = sample_shell(model, x_surf, d_offset, d_direction=d_direction, n_shell=n_shell)
-    M = x_w.shape[0]
-
-    # ---------- helper that enforces finite model output ------------------
     def f(pts: torch.Tensor):
-        y = model(pts.view(-1, 3)).reshape(-1)
-        return y
+        return model(pts).view(-1)
 
-    # ---------- one-sided mixed stencil using step size h -----------------
-    f00 = f(x_w)
-    fu = f(x_w + h_step * u)
-    fv = f(x_w + h_step * v)
-    fuv = f(x_w + h_step * (u + v))
+    # Original approach uses 6 calls - we can reduce to 4
+    # Using forward differences instead of central differences
+    f00 = y.view(-1)
 
-    Duv = (fuv - fu - fv + f00) / (h_step * h_step)
-    loss = Duv.abs()  # (M,)
+    # Only compute the 4 corner points instead of 6 points
+    f_u = f(x + h_step * u)  # Call 1
+    f_v = f(x + h_step * v)  # Call 2
+    f_uv = f(x + h_step * (u + v))  # Call 3
+    f_origin = f(x)  # Call 4 (could reuse f00)
 
-    # ---------- optional central (±h) correction --------------------------
-    if central:
-        fu_m = f(x_w - h_step * u)
-        fv_m = f(x_w - h_step * v)
-        fuv_m = f(x_w - h_step * (u + v))
-        Duv_m = (fuv_m - fu_m - fv_m + f00) / (h_step * h_step)
-        loss = 0.5 * (Duv + Duv_m).abs()
+    # Compute mixed derivative using forward differences
+    Duv = (f_uv - f_u - f_v + f_origin) / (h_step * h_step)
+    return Duv.abs()
+
+
+def get_fermi(model, points, grad, offset_d):
+    x = points.detach().requires_grad_(True)
+    n = F.normalize(grad, p=2, dim=-1, eps=1e-9)
+    n.detach()
+    rand = torch.randn(n.shape, device=x.device)
+    x_u = F.normalize(torch.cross(n, rand, dim=-1), dim=-1)
+    x_v = F.normalize(torch.cross(n, x_u, dim=-1), dim=-1)
+    x_w = offset_d * n + x
+    return x_u.detach(), x_v.detach(), x_w.detach()
+
+
+def optimized_get_proxy_loss(model, points, offset_d, h_step, finite_difference, optimization_level, config):
+    pred = model(points)
+    grad = compute_gradient(points, pred)
+    u, v, x_w = get_fermi(model, points, grad, offset_d)
+    x_w = x_w.requires_grad_(True)
+    pred_w = model(x_w)
+    grad_w = compute_gradient(x_w, pred_w)
+
+    loss = optimized_finite_proxy_loss(x_w, pred_w, u, v, h_step, model)
 
     return loss.mean()

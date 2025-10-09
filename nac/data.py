@@ -2,7 +2,6 @@ import torch
 import open3d as o3d
 import numpy as np
 from torch import Tensor
-from nac.visualization import show
 from nac.settings import ReconstructionConfig
 from scipy.spatial import cKDTree
 from dataclasses import dataclass
@@ -12,6 +11,7 @@ class TrainingData:
     on_manifold_points: Tensor
     off_manifold_points: Tensor
     near_manifold_points: Tensor
+    on_manifold_normals: Tensor
 
 class SirenDataset:
     def __init__(self, config: ReconstructionConfig, point_cloud: o3d.geometry.PointCloud):
@@ -24,8 +24,8 @@ class SirenDataset:
         sigmas = dist[:, -1:].astype(np.float32)
 
         self.sigmas = torch.from_numpy(sigmas).to(config.device)
-        self.points = torch.from_numpy(points).to(config.device)
         self.normals = torch.from_numpy(normals).to(config.device)
+        self.points = torch.from_numpy(points).to(config.device) + config.offset * self.normals
 
     def sample(self) -> TrainingData:
         n = self.config.samples
@@ -33,16 +33,19 @@ class SirenDataset:
 
         random_indices = torch.randperm(len(self.points))[:n]
         on_manifold_points = self.points[random_indices].to(device)
+        on_manifold_normals = self.normals[random_indices].to(device)
 
-        off_manifold_points = 2 * (torch.rand(size=(n, 3)) -0.5).to(device)
+        off_manifold_points = self.config.bounding_box_extent * 2 * (torch.rand(size=(3 * n, 3)) -0.5).to(device)
         near_manifold_points = torch.normal(mean=on_manifold_points, std=self.sigmas[random_indices]).to(device)
 
         on_manifold_points.requires_grad = True
         off_manifold_points.requires_grad = True
         near_manifold_points.requires_grad = True
+        on_manifold_normals.requires_grad = True
 
         return TrainingData(
             on_manifold_points=on_manifold_points,
             off_manifold_points=off_manifold_points,
-            near_manifold_points=near_manifold_points
+            near_manifold_points=near_manifold_points,
+            on_manifold_normals=on_manifold_normals
         )

@@ -5,7 +5,7 @@ from tqdm import tqdm
 
 from .data import SirenDataset
 from .settings import TrainingConfig
-from .loss import manifold_loss, non_manifold_loss, eikonal_loss, first_order_morse_loss
+from .loss import manifold_loss, non_manifold_loss, eikonal_loss, optimized_get_proxy_loss, orientation_loss
 from abc import ABC, abstractmethod
 from torch import Tensor
 
@@ -75,7 +75,8 @@ class FlatCAD(Siren):
         self.manifold_weight = 7e3
         self.non_manifold_weight = 6e2
         self.eikonal_weight = 5e1
-        self.morse_weight = 10
+        self.normal_weight = 2e2
+        self.orientation_weight = 5e2
 
     def train_point_cloud(self, config: TrainingConfig, dataset: SirenDataset):
         optimizer = optim.Adam(self.parameters(), lr=config.learning_rate)
@@ -87,33 +88,43 @@ class FlatCAD(Siren):
             data = dataset.sample()
             on_manifold_points = data.on_manifold_points
             off_manifold_points = data.off_manifold_points
+            near_manifold_points = data.near_manifold_points
+            on_manifold_normals = data.on_manifold_normals
 
             on_manifold_sdf = self(on_manifold_points)
             off_manifold_sdf = self(off_manifold_points)
+            near_manifold_sdf = self(near_manifold_points)
 
-            manifold_grad = compute_gradient(on_manifold_points, on_manifold_sdf)
+            on_manifold_grad = compute_gradient(on_manifold_points, on_manifold_sdf)
+            off_manifold_grad = compute_gradient(off_manifold_points, off_manifold_sdf)
+            near_manifold_grad = compute_gradient(near_manifold_points, near_manifold_sdf)
 
             on_manifold_term = manifold_loss(on_manifold_sdf)
-            off_manifold_term = non_manifold_loss(off_manifold_sdf, alpha=1e2)
-            eikonal_term = eikonal_loss(manifold_grad)
-            morse_term = first_order_morse_loss(self, on_manifold_points)
+            off_manifold_term = non_manifold_loss(off_manifold_sdf, alpha=config.non_manifold_alpha)
+            eikonal_term = eikonal_loss(on_manifold_grad) + eikonal_loss(off_manifold_grad) + eikonal_loss(near_manifold_grad)
+            normal_term = manifold_loss(on_manifold_normals - on_manifold_grad)
+            orientation_term = orientation_loss(off_manifold_points, on_manifold_points, on_manifold_normals)
 
-            total_loss = (self.manifold_weight * on_manifold_term +
-                          self.non_manifold_weight * off_manifold_term +
-                          self.eikonal_weight * eikonal_term +
-                          self.morse_weight * morse_term)
+            total_loss = (
+                self.manifold_weight * on_manifold_term +
+                self.non_manifold_weight * off_manifold_term +
+                self.eikonal_weight * eikonal_term +
+                self.normal_weight * normal_term +
+                self.orientation_weight * orientation_term
+            )
 
             loss_dict = {
                 'loss': total_loss,
                 'manifold_term': on_manifold_term,
                 'non_manifod_term': off_manifold_term,
                 'eikonal_term': eikonal_term,
-                'morse_term': morse_term,
+                'normal_term': normal_term,
+                'orientation_term': orientation_term,
             }
 
             optimizer.zero_grad()
             total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.parameters(), 10.0)
+            torch.nn.utils.clip_grad_norm_(self.parameters(), config.gradient_clip)
             optimizer.step()
 
             progress_bar.set_postfix({loss_name: loss_value.item() for loss_name, loss_value in loss_dict.items()})
